@@ -1,0 +1,26 @@
+# Credentials
+.env
+
+# State (auto-generated)
+sticker_state.json
+price_history.json
+
+# Image caches (auto-downloaded)
+gift_cache/
+emoji/
+
+# Temp frames for video encoding
+_frames/
+
+# Python
+*.pyc
+__pycache__/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Test artifacts
+test_sticker.*
+*.tgs
