@@ -111,8 +111,16 @@ cp .env.example .env
 Edit `.env` / Отредактируйте `.env`:
 
 ```env
+# Required / Обязательные:
 TELEGRAM_BOT_TOKEN=<from @BotFather>
 OWNER_USER_ID=<from @userinfobot>
+MRKT_ACCESS_TOKEN=<from browser DevTools on tgmrkt.io>
+DUNE_API_KEY=<from https://dune.com/settings/api>
+
+# Optional / Опциональные (only for find_gift_ids.py --mtproto):
+TELEGRAM_API_ID=<from https://my.telegram.org/apps>
+TELEGRAM_API_HASH=<from https://my.telegram.org/apps>
+
 ```
 
 ### 4. Run / Запуск
