@@ -5,13 +5,13 @@ MRKT Animated Sticker Pack — Auto-updating animated sticker packs.
 EN: Creates and maintains 3 Telegram sticker packs (50 stickers each = 150 total)
     with real-time floor prices from the MRKT gift marketplace.
     Supports animated WebM video stickers (with ffmpeg) and static WebP fallback.
-    Data sources: giftstat API (prices, supply), Binance (TON/USD), changes.tg (images).
+    Data sources: MRKT API (prices), Dune Analytics (supply), Binance (TON/USD), changes.tg (images).
     Update cycle: every 60 seconds.
 
 RU: Создаёт и поддерживает 3 Telegram-стикерпака (по 50 = 150 всего)
     с актуальными ценами подарков с маркетплейса MRKT.
     Поддерживает анимированные WebM видео-стикеры (через ffmpeg) и статичные WebP.
-    Источники: giftstat API (цены, supply), Binance (TON/USD), changes.tg (картинки).
+    Источники: MRKT API (цены), Dune Analytics (supply), Binance (TON/USD), changes.tg (картинки).
     Цикл обновления: каждые 60 секунд.
 
 Usage / Запуск:
@@ -35,6 +35,7 @@ from aiogram import Bot
 from aiogram.types import InputSticker, BufferedInputFile
 
 from sticker_image import generate_sticker
+from mrkt_parser import fetch_mrkt_prices, get_upgraded_prices
 
 # ─── Load .env ────────────────────────────────────────────────────
 def load_dotenv():
@@ -57,9 +58,9 @@ UPDATE_INTERVAL = 60  # секунд
 MAX_STICKERS = 50
 ANIMATED = os.environ.get("ANIMATED_STICKERS", "1").lower() in ("1", "true", "yes")
 
-GIFTSTAT_FLOOR_API = "https://api.giftstat.app/current/collections/floor"
-GIFTSTAT_COLLECTIONS_API = "https://api.giftstat.app/current/collections"
 BINANCE_API = "https://api.binance.com/api/v3/ticker/price?symbol=TONUSDT"
+DUNE_API_KEY = os.environ.get("DUNE_API_KEY", "")
+DUNE_QUERY_ID = 5133545
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sticker_state.json")
 
@@ -205,7 +206,25 @@ EMOJI_MAP = {
     "chillflame": "🔥",
     "restlessjar": "🫙",
     "jollychimp": "🐒",
+    # ─── Unupgraded gifts ───
+    "trojanhorse": "🐴",
+    "mask": "🎭",
+    "coffin": "⚰",
+    "gravestone": "🪦",
+    "durovsboots": "👢",
+    "durovscoat": "🧥",
+    "ufcbox": "🥊",
+    "durovsfigurine": "🗿",
+    "airplane": "✈",
 }
+
+# ─── Unupgraded Gems config ─────────────────────────────────────
+UNUPGRADED_SLUGS = [
+    "trojanhorse", "mask", "coffin", "gravestone",
+    "durovsboots", "durovscoat", "ufcbox",
+    "khabibspapakha", "durovsfigurine", "airplane",
+]
+UNUPGRADED_SET = set(s.lower() for s in UNUPGRADED_SLUGS)
 
 # CDN для картинок подарков (changes.tg)
 CHANGES_TG_API = "https://api.changes.tg"
@@ -475,46 +494,93 @@ async def fetch_ton_rate():
             return 7.2
 
 
-async def fetch_collections(market="mrkt"):
-    """Получает коллекции: floor prices + supply из двух endpoint'ов giftstat API."""
+def _name_to_slug(name):
+    """Convert gift name to slug: 'Plush Pepe' -> 'plushpepe'."""
+    import re
+    return re.sub(r'[^a-z0-9]', '', (name or '').lower())
+
+
+async def fetch_supply():
+    """Fetch supply data from Dune Analytics (query 5133545)."""
+    supply_map = {}
+    if not DUNE_API_KEY:
+        log.warning("DUNE_API_KEY not set, supply will show '--'")
+        return supply_map
     async with aiohttp.ClientSession() as s:
         try:
-            url = f"{GIFTSTAT_FLOOR_API}?marketplace={market}&limit=200"
-            async with s.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
+            url = f"https://api.dune.com/api/v1/query/{DUNE_QUERY_ID}/results"
+            headers = {"X-DUNE-API-KEY": DUNE_API_KEY}
+            async with s.get(url, headers=headers,
+                             timeout=aiohttp.ClientTimeout(total=30)) as r:
+                if r.status != 200:
+                    log.warning(f"Dune API: {r.status}")
+                    return supply_map
                 data = await r.json()
-                cols = data.get("data", data) if isinstance(data, dict) else data
-                if not isinstance(cols, list):
-                    return []
-
-            supply_map = {}
-            try:
-                url2 = f"{GIFTSTAT_COLLECTIONS_API}?limit=500"
-                async with s.get(url2, timeout=aiohttp.ClientTimeout(total=15)) as r2:
-                    data2 = await r2.json()
-                    cols2 = data2.get("data", data2) if isinstance(data2, dict) else data2
-                    if isinstance(cols2, list):
-                        for c in cols2:
-                            slug = (c.get("collection_slug") or c.get("slug") or "").lower()
-                            supply = c.get("issued") or c.get("minted") or c.get("supply") or c.get("total_supply")
-                            if slug and supply:
-                                try:
-                                    supply_map[slug] = int(supply)
-                                except (ValueError, TypeError):
-                                    pass
-                        log.info(f"Supply data: {len(supply_map)} collections from /current/collections")
-            except Exception as e:
-                log.warning(f"Supply fetch error: {e}")
-
-            for col in cols:
-                slug = col.get("slug", "").lower()
-                if slug in supply_map:
-                    col["supply"] = supply_map[slug]
-
-            return sorted(cols, key=lambda c: -(c.get("floor_price", 0)))
-
+            rows = data.get("result", {}).get("rows", [])
+            for row in rows:
+                name = row.get("collection", "")
+                supply = row.get("max_supply") or row.get("initial_supply") or 0
+                if name and supply:
+                    slug = _name_to_slug(name)
+                    if slug:
+                        try:
+                            supply_map[slug] = int(supply)
+                        except (ValueError, TypeError):
+                            pass
+            log.info(f"Supply data: {len(supply_map)} collections from Dune")
         except Exception as e:
-            log.warning(f"Collections error ({market}): {e}")
-    return []
+            log.warning(f"Dune supply fetch failed: {e}")
+    return supply_map
+
+
+async def fetch_collections():
+    """Fetch all collections from MRKT API, enriched with Dune supply.
+
+    Returns (all_collections, unupgraded_expensive, exclude_from_main).
+    """
+    prices = await fetch_mrkt_prices()
+    if not prices:
+        return [], {}, set()
+
+    cheapest = {}
+    expensive = {}
+    for p in prices:
+        slug = p["slug"]
+        if slug not in cheapest or p["floor_price"] < cheapest[slug]["floor_price"]:
+            cheapest[slug] = p
+        if slug not in expensive or p["floor_price"] > expensive[slug]["floor_price"]:
+            expensive[slug] = p
+
+    dual_version_slugs = set()
+    exclude_from_main = set()
+    for slug in UNUPGRADED_SET:
+        if slug in cheapest and slug in expensive:
+            if cheapest[slug]["floor_price"] != expensive[slug]["floor_price"]:
+                dual_version_slugs.add(slug)
+            else:
+                exclude_from_main.add(slug)
+        elif slug in expensive:
+            exclude_from_main.add(slug)
+
+    result = {}
+    for slug in expensive:
+        if slug in dual_version_slugs:
+            result[slug] = cheapest[slug]
+        else:
+            result[slug] = expensive[slug]
+
+    collections = sorted(result.values(), key=lambda c: -(c["floor_price"]))
+
+    supply_map = await fetch_supply()
+    if supply_map:
+        for col in collections:
+            if col["slug"] in supply_map:
+                col["supply"] = supply_map[col["slug"]]
+        for slug in expensive:
+            if slug in supply_map and slug not in dual_version_slugs:
+                expensive[slug]["supply"] = supply_map[slug]
+
+    return collections, expensive, exclude_from_main
 
 
 # ─── Sticker generation helper ───────────────────────────────────
@@ -536,6 +602,119 @@ def _generate_sticker_data(col, ton_usd, gift_img):
 # ─── Sticker pack management ─────────────────────────────────────
 
 NUM_PACKS = 3
+
+
+async def sync_unupgraded_pack(bot: Bot, set_name, collections, ton_usd, state):
+    """Create or update the unupgraded gems sticker pack."""
+    pack_state = state.setdefault(set_name, {})
+
+    existing = None
+    try:
+        existing = await bot.get_sticker_set(name=set_name)
+        log.info(f"  Unupgraded pack {set_name}: {len(existing.stickers)} stickers")
+    except Exception:
+        pass
+
+    if not existing:
+        if not collections:
+            return
+
+        col = collections[0]
+        slug = col.get("slug", "unknown")
+        gift_img = match_gift_image(slug)
+        sticker_data, sticker_fmt, sticker_fname = _generate_sticker_data(col, ton_usd, gift_img)
+
+        try:
+            sticker = InputSticker(
+                sticker=BufferedInputFile(sticker_data, filename=sticker_fname),
+                emoji_list=[get_emoji(slug)],
+                format=sticker_fmt,
+            )
+            await bot.create_new_sticker_set(
+                user_id=OWNER_ID,
+                name=set_name,
+                title="MRKT Unupgraded Gems",
+                stickers=[sticker],
+            )
+            log.info(f"  Unupgraded pack created: https://t.me/addstickers/{set_name}")
+
+            sset = await bot.get_sticker_set(name=set_name)
+            pack_state[slug.lower()] = sset.stickers[0].file_id
+
+            for col in collections[1:MAX_STICKERS]:
+                await asyncio.sleep(0.5)
+                s = col.get("slug", "")
+                gi = match_gift_image(s)
+                sd, sf, sfn = _generate_sticker_data(col, ton_usd, gi)
+                try:
+                    st = InputSticker(
+                        sticker=BufferedInputFile(sd, filename=sfn),
+                        emoji_list=[get_emoji(s)],
+                        format=sf,
+                    )
+                    await bot.add_sticker_to_set(
+                        user_id=OWNER_ID, name=set_name, sticker=st)
+                    sset = await bot.get_sticker_set(name=set_name)
+                    pack_state[s.lower()] = sset.stickers[-1].file_id
+                    log.info(f"    + {s} (unupgraded, {len(sd)/1024:.1f}KB)")
+                except Exception as e:
+                    log.warning(f"    Failed to add unupgraded {s}: {e}")
+
+        except Exception as e:
+            log.error(f"  Failed to create unupgraded pack: {e}")
+
+    else:
+        existing_file_ids = {s.file_id for s in existing.stickers}
+        updated = 0
+
+        for col in collections[:MAX_STICKERS]:
+            slug = col.get("slug", "").lower()
+            if not slug:
+                continue
+
+            gift_img = match_gift_image(slug)
+            sticker_data, sticker_fmt, sticker_fname = _generate_sticker_data(col, ton_usd, gift_img)
+            old_fid = pack_state.get(slug)
+
+            if old_fid and old_fid in existing_file_ids:
+                try:
+                    new_sticker = InputSticker(
+                        sticker=BufferedInputFile(sticker_data, filename=sticker_fname),
+                        emoji_list=[get_emoji(slug)],
+                        format=sticker_fmt,
+                    )
+                    await bot.replace_sticker_in_set(
+                        user_id=OWNER_ID, name=set_name,
+                        old_sticker=old_fid, sticker=new_sticker)
+                    updated += 1
+                    sset = await bot.get_sticker_set(name=set_name)
+                    _refresh_file_ids(pack_state, sset)
+                except Exception as e:
+                    log.warning(f"    Replace failed for unupgraded {slug}: {e}")
+            else:
+                gi = match_gift_image(slug)
+                sd, sf, sfn = _generate_sticker_data(col, ton_usd, gi)
+                try:
+                    st = InputSticker(
+                        sticker=BufferedInputFile(sd, filename=sfn),
+                        emoji_list=[get_emoji(slug)],
+                        format=sf,
+                    )
+                    await bot.add_sticker_to_set(
+                        user_id=OWNER_ID, name=set_name, sticker=st)
+                    sset = await bot.get_sticker_set(name=set_name)
+                    pack_state[slug] = sset.stickers[-1].file_id
+                    log.info(f"    + {slug} (unupgraded, {len(sd)/1024:.1f}KB)")
+                    updated += 1
+                except Exception as e:
+                    log.warning(f"    Failed to add unupgraded {slug}: {e}")
+
+            await asyncio.sleep(0.35)
+
+        log.info(f"  Unupgraded pack: updated {updated} stickers")
+
+    state[set_name] = pack_state
+    save_state(state)
 
 
 async def sync_sticker_pack(bot: Bot, set_name, collections, ton_usd, state, pack_num=1):
@@ -703,10 +882,15 @@ def prompt_pack_settings(username):
             else:
                 pack_names.append(f"{user_name}_{i+1}{suffix}")
 
+        unupgraded_pack_name = f"unupgradedgems{suffix}"
+
         print(f"\n  ┌─────────────────────────────────────────────┐")
         print(f"  │  Title: {user_title}")
         for i, pn in enumerate(pack_names):
             print(f"  │  Pack {i+1}: t.me/addstickers/{pn}")
+        if UNUPGRADED_SLUGS:
+            print(f"  │  Unupgraded: t.me/addstickers/{unupgraded_pack_name}")
+            print(f"  │  Unupgraded gifts: {len(UNUPGRADED_SLUGS)}")
         print(f"  └─────────────────────────────────────────────┘")
 
         confirm = input("\n  Confirm? / Подтвердить? [Y/n]: ").strip().lower()
@@ -714,7 +898,7 @@ def prompt_pack_settings(username):
             break
         print("  Retrying... / Повтор...\n")
 
-    return pack_names, user_title
+    return pack_names, user_title, unupgraded_pack_name
 
 
 async def main():
@@ -722,7 +906,7 @@ async def main():
     me = await bot.get_me()
     log.info(f"Bot: @{me.username}")
 
-    pack_names, pack_title = prompt_pack_settings(me.username)
+    pack_names, pack_title, unupgraded_pack_name = prompt_pack_settings(me.username)
 
     await load_gift_images(bot)
 
@@ -745,6 +929,8 @@ async def main():
 ╠══════════════════════════════════════════════════╣""")
     for i, pn in enumerate(pack_names):
         print(f"║  #{i+1}: t.me/addstickers/{pn}")
+    if UNUPGRADED_SLUGS:
+        print(f"║  Unupgraded: t.me/addstickers/{unupgraded_pack_name}")
     print(f"╚══════════════════════════════════════════════════╝\n")
 
     cycle = 0
@@ -755,22 +941,43 @@ async def main():
 
         try:
             ton_usd = await fetch_ton_rate()
-            collections = await fetch_collections("mrkt")
+            collections, expensive_map, exclude_set = await fetch_collections()
 
             if not collections:
                 log.warning("No collections, skipping")
             else:
-                log.info(f"Fetched {len(collections)} collections, TON=${ton_usd:.2f}")
+                log.info(f"Fetched {len(collections)} collections from MRKT, TON=${ton_usd:.2f}")
+
+                # Main packs: exclude only single-version unupgraded slugs
+                main_cols = [c for c in collections if c["slug"] not in exclude_set]
+                log.info(f"Main packs: {len(main_cols)} collections (excluded {len(exclude_set)} unupgraded)")
 
                 for i, pack_name in enumerate(pack_names):
-                    chunk = collections[i * MAX_STICKERS : (i + 1) * MAX_STICKERS]
+                    chunk = main_cols[i * MAX_STICKERS : (i + 1) * MAX_STICKERS]
                     if not chunk:
                         break
                     log.info(f"Pack #{i+1} ({pack_name}): {len(chunk)} collections")
                     await sync_sticker_pack(bot, pack_name, chunk, ton_usd, state, i + 1)
 
                 total = sum(len(state.get(pn, {})) for pn in pack_names)
-                log.info(f"✓ Total: {total} stickers across {NUM_PACKS} packs")
+                log.info(f"Total: {total} stickers across {NUM_PACKS} packs")
+
+                # ─── Unupgraded Gems pack (uses most expensive version per slug) ───
+                if UNUPGRADED_SLUGS:
+                    unupgraded_cols = []
+                    for slug in UNUPGRADED_SLUGS:
+                        col = expensive_map.get(slug.lower())
+                        if col:
+                            unupgraded_cols.append(col)
+                        else:
+                            log.warning(f"Unupgraded gift '{slug}' not found in MRKT")
+
+                    if unupgraded_cols:
+                        log.info(f"Unupgraded pack ({unupgraded_pack_name}): "
+                                 f"{len(unupgraded_cols)} gifts")
+                        await sync_unupgraded_pack(
+                            bot, unupgraded_pack_name, unupgraded_cols,
+                            ton_usd, state)
 
         except Exception as e:
             log.error(f"Error: {e}", exc_info=True)
