@@ -30,7 +30,7 @@ async def main():
     log.info(f"Bot: @{me.username}")
 
     suffix = f"_by_{me.username}"
-    pack_name = f"unupgradedgems{suffix}"
+    pack_name = f"unupgradedgemss{suffix}"
 
     print(f"\n  Testing ONLY unupgraded pack:")
     print(f"  Pack: t.me/addstickers/{pack_name}")
