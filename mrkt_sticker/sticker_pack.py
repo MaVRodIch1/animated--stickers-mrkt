@@ -667,10 +667,14 @@ async def sync_unupgraded_pack(bot: Bot, set_name, collections, ton_usd, state):
         existing_file_ids = {s.file_id for s in existing.stickers}
         updated = 0
 
+        # Track which slugs we're syncing this round
+        current_slugs = set()
+
         for col in collections[:MAX_STICKERS]:
             slug = col.get("slug", "").lower()
             if not slug:
                 continue
+            current_slugs.add(slug)
 
             gift_img = match_gift_image(slug)
             sticker_data, sticker_fmt, sticker_fname = _generate_sticker_data(col, ton_usd, gift_img)
@@ -710,6 +714,27 @@ async def sync_unupgraded_pack(bot: Bot, set_name, collections, ton_usd, state):
                     log.warning(f"    Failed to add unupgraded {slug}: {e}")
 
             await asyncio.sleep(0.35)
+
+        # Remove stale stickers that no longer belong to the unupgraded set
+        # 1) Remove slugs from pack_state that aren't in current collections
+        stale_slugs = [s for s in list(pack_state.keys()) if s not in current_slugs]
+        for s in stale_slugs:
+            pack_state.pop(s, None)
+
+        # 2) Delete any stickers from the actual pack that aren't tracked by current pack_state
+        sset = await bot.get_sticker_set(name=set_name)
+        known_fids = set(pack_state.values())
+        removed = 0
+        for sticker in sset.stickers:
+            if sticker.file_id not in known_fids:
+                try:
+                    await bot.delete_sticker_from_set(sticker=sticker.file_id)
+                    removed += 1
+                    await asyncio.sleep(0.3)
+                except Exception as e:
+                    log.warning(f"    Failed to remove stale sticker: {e}")
+        if removed:
+            log.info(f"  Removed {removed} stale stickers from unupgraded pack")
 
         log.info(f"  Unupgraded pack: updated {updated} stickers")
 
@@ -882,7 +907,7 @@ def prompt_pack_settings(username):
             else:
                 pack_names.append(f"{user_name}_{i+1}{suffix}")
 
-        unupgraded_pack_name = f"unupgradedgems{suffix}"
+        unupgraded_pack_name = f"unupgradedmrkt{suffix}"
 
         print(f"\n  ┌─────────────────────────────────────────────┐")
         print(f"  │  Title: {user_title}")
