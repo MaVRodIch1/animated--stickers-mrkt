@@ -15,10 +15,9 @@ Packs refresh every 60 seconds.
 ## How it works / Как это работает
 
 ```
-MRKT Contest API ──>  floor prices (24h change computed from local history)
-Dune Analytics   ──>  supply data (total/remaining)
-Binance API      ──>  TON/USD rate
-changes.tg       ──>  gift images (by MTProto gift ID)
+giftstat API  ──>  floor prices, 24h change, supply
+Binance API   ──>  TON/USD rate
+changes.tg    ──>  gift images (by MTProto gift ID)
                         |
                         v
               +---------------------+
@@ -115,24 +114,14 @@ Edit `.env` / Отредактируйте `.env`:
 # Required / Обязательные:
 TELEGRAM_BOT_TOKEN=<from @BotFather>
 OWNER_USER_ID=<from @userinfobot>
-MRKT_CONTEST_KEY=<request from MRKT team — sent as X-CONTEST-KEY header>
+MRKT_ACCESS_TOKEN=<from browser DevTools on tgmrkt.io>
 DUNE_API_KEY=<from https://dune.com/settings/api>
 
 # Optional / Опциональные (only for find_gift_ids.py --mtproto):
 TELEGRAM_API_ID=<from https://my.telegram.org/apps>
 TELEGRAM_API_HASH=<from https://my.telegram.org/apps>
+
 ```
-
-**MRKT Contest API Key / Ключ Contest API:**
-Prices are fetched from `https://contest.tgmrkt.io/contest/v1/gifts-collections`
-with the key passed in the `X-CONTEST-KEY` header. Request the key from the MRKT team.
-Цены берутся с `https://contest.tgmrkt.io/contest/v1/gifts-collections`,
-ключ передаётся в заголовке `X-CONTEST-KEY`. Запросите ключ у команды MRKT.
-
-**How to get Dune API Key / Как получить Dune ключ:**
-1. Register at https://dune.com / Зарегистрируйтесь на dune.com
-2. Go to Settings -> API / Перейдите в Settings -> API
-3. Create a new API key / Создайте новый API ключ
 
 ### 4. Run / Запуск
 
@@ -205,10 +194,11 @@ On first run, `sticker_pack.py` will ask for pack name and title, then download 
 
 | API | Endpoint | Data |
 |---|---|---|
-| MRKT Contest | `contest.tgmrkt.io/contest/v1/gifts-collections` | Floor prices (24h change computed locally from price history) |
-| Dune Analytics | `api.dune.com/api/v1/query/{id}/results` | Supply data (total/remaining) |
+| giftstat | `api.giftstat.app/current/collections/floor` | Floor prices + 24h change |
+| giftstat | `api.giftstat.app/current/collections` | Supply data |
 | Binance | `api.binance.com/api/v3/ticker/price` | TON/USD rate |
 | changes.tg | `api.changes.tg/original/{gift_id}.png` | Gift images |
+| giftstat CDN | `ddejfvww7sqtk.cloudfront.net/...` | Override images for broken entries |
 | Telegram | Bot API via aiogram | Sticker pack CRUD |
 
 ---
