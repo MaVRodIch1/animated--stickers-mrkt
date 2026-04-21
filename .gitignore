@@ -24,3 +24,4 @@ __pycache__/
 # Test artifacts
 test_sticker.*
 *.tgs
+mrkt_sticker/mrkt_price_history.json
