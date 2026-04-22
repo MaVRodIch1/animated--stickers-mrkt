@@ -23,8 +23,10 @@ Usage / Запуск:
 
 import io
 import os
+import re
 import sys
 import json
+import time
 import asyncio
 import logging
 from datetime import datetime
@@ -54,9 +56,60 @@ load_dotenv()
 # ─── Config ───────────────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 OWNER_ID = int(os.environ.get("OWNER_USER_ID", "0"))
-UPDATE_INTERVAL = 60  # секунд
+UPDATE_INTERVAL = 300  # секунд (5 минут — снижает риск flood control)
+API_SLEEP = 1.5        # пауза между API-вызовами
+PRICE_PRECISION = 4
+CHANGE_PRECISION = 1
 MAX_STICKERS = 50
 ANIMATED = os.environ.get("ANIMATED_STICKERS", "1").lower() in ("1", "true", "yes")
+
+
+# ─── Flood control ────────────────────────────────────────────────
+_flood_until = 0.0
+
+
+class FloodControlError(Exception):
+    def __init__(self, retry_after: int):
+        self.retry_after = retry_after
+        super().__init__(f"Flood control until retry_after={retry_after}s")
+
+
+def _check_flood():
+    remaining = _flood_until - time.time()
+    if remaining > 0:
+        raise FloodControlError(int(remaining))
+
+
+def _is_flood(e):
+    s = str(e).lower()
+    return "flood control" in s or "too many requests" in s
+
+
+def _on_flood(e):
+    global _flood_until
+    m = re.search(r"[Rr]etry (?:in|after) (\d+)", str(e))
+    secs = int(m.group(1)) if m else 60
+    _flood_until = time.time() + secs + 60
+    log.error(f"FLOOD CONTROL: retry after {secs}s — all sticker ops paused")
+    raise FloodControlError(secs)
+
+
+# ─── Price change detection ───────────────────────────────────────
+
+def _price_changed(state, set_name, slug, floor_price, change_24h):
+    rendered = state.get("_rendered", {}).get(set_name, {}).get(slug)
+    if not rendered:
+        return True
+    if round(floor_price, PRICE_PRECISION) != round(rendered.get("p", 0), PRICE_PRECISION):
+        return True
+    if round(change_24h, CHANGE_PRECISION) != round(rendered.get("c", 0), CHANGE_PRECISION):
+        return True
+    return False
+
+
+def _mark_rendered(state, set_name, slug, floor_price, change_24h):
+    rendered = state.setdefault("_rendered", {}).setdefault(set_name, {})
+    rendered[slug] = {"p": floor_price, "c": change_24h}
 
 BINANCE_API = "https://api.binance.com/api/v3/ticker/price?symbol=TONUSDT"
 DUNE_API_KEY = os.environ.get("DUNE_API_KEY", "")
@@ -536,11 +589,11 @@ async def fetch_supply():
 async def fetch_collections():
     """Fetch all collections from MRKT API, enriched with Dune supply.
 
-    Returns (all_collections, unupgraded_expensive, exclude_from_main).
+    Returns (all_collections, expensive_map, cheapest_map, exclude_from_main).
     """
     prices = await fetch_mrkt_prices()
     if not prices:
-        return [], {}, set()
+        return [], {}, {}, set()
 
     cheapest = {}
     expensive = {}
@@ -579,8 +632,11 @@ async def fetch_collections():
         for slug in expensive:
             if slug in supply_map and slug not in dual_version_slugs:
                 expensive[slug]["supply"] = supply_map[slug]
+        for slug in cheapest:
+            if slug in supply_map:
+                cheapest[slug]["supply"] = supply_map[slug]
 
-    return collections, expensive, exclude_from_main
+    return collections, expensive, cheapest, exclude_from_main
 
 
 # ─── Sticker generation helper ───────────────────────────────────
@@ -666,21 +722,30 @@ async def sync_unupgraded_pack(bot: Bot, set_name, collections, ton_usd, state):
     else:
         existing_file_ids = {s.file_id for s in existing.stickers}
         updated = 0
+        skipped = 0
 
         # Track which slugs we're syncing this round
         current_slugs = set()
 
         for col in collections[:MAX_STICKERS]:
+            _check_flood()
+
             slug = col.get("slug", "").lower()
             if not slug:
                 continue
             current_slugs.add(slug)
 
-            gift_img = match_gift_image(slug)
-            sticker_data, sticker_fmt, sticker_fname = _generate_sticker_data(col, ton_usd, gift_img)
+            floor_price = col.get("floor_price", 0)
+            change_24h = col.get("change_24h", 0)
             old_fid = pack_state.get(slug)
 
             if old_fid and old_fid in existing_file_ids:
+                if not _price_changed(state, set_name, slug, floor_price, change_24h):
+                    skipped += 1
+                    continue
+
+                gift_img = match_gift_image(slug)
+                sticker_data, sticker_fmt, sticker_fname = _generate_sticker_data(col, ton_usd, gift_img)
                 try:
                     new_sticker = InputSticker(
                         sticker=BufferedInputFile(sticker_data, filename=sticker_fname),
@@ -691,9 +756,12 @@ async def sync_unupgraded_pack(bot: Bot, set_name, collections, ton_usd, state):
                         user_id=OWNER_ID, name=set_name,
                         old_sticker=old_fid, sticker=new_sticker)
                     updated += 1
+                    _mark_rendered(state, set_name, slug, floor_price, change_24h)
                     sset = await bot.get_sticker_set(name=set_name)
                     _refresh_file_ids(pack_state, sset)
                 except Exception as e:
+                    if _is_flood(e):
+                        _on_flood(e)
                     log.warning(f"    Replace failed for unupgraded {slug}: {e}")
             else:
                 gi = match_gift_image(slug)
@@ -710,10 +778,13 @@ async def sync_unupgraded_pack(bot: Bot, set_name, collections, ton_usd, state):
                     pack_state[slug] = sset.stickers[-1].file_id
                     log.info(f"    + {slug} (unupgraded, {len(sd)/1024:.1f}KB)")
                     updated += 1
+                    _mark_rendered(state, set_name, slug, floor_price, change_24h)
                 except Exception as e:
+                    if _is_flood(e):
+                        _on_flood(e)
                     log.warning(f"    Failed to add unupgraded {slug}: {e}")
 
-            await asyncio.sleep(0.35)
+            await asyncio.sleep(API_SLEEP)
 
         # Remove stale stickers that no longer belong to the unupgraded set
         # 1) Remove slugs from pack_state that aren't in current collections
@@ -790,17 +861,25 @@ async def sync_sticker_pack(bot: Bot, set_name, collections, ton_usd, state, pac
         existing_file_ids = {s.file_id for s in existing.stickers}
 
         updated = 0
+        skipped = 0
         for col in collections[:MAX_STICKERS]:
+            _check_flood()
+
             slug = col.get("slug", "")
             if not slug:
                 continue
             slug_lower = slug.lower()
-
-            gift_img = match_gift_image(slug)
-            sticker_data, sticker_fmt, sticker_fname = _generate_sticker_data(col, ton_usd, gift_img)
+            floor_price = col.get("floor_price", 0)
+            change_24h = col.get("change_24h", 0)
             old_fid = pack_state.get(slug_lower)
 
             if old_fid and old_fid in existing_file_ids:
+                if not _price_changed(state, set_name, slug_lower, floor_price, change_24h):
+                    skipped += 1
+                    continue
+
+                gift_img = match_gift_image(slug)
+                sticker_data, sticker_fmt, sticker_fname = _generate_sticker_data(col, ton_usd, gift_img)
                 try:
                     new_sticker = InputSticker(
                         sticker=BufferedInputFile(sticker_data, filename=sticker_fname),
@@ -814,27 +893,36 @@ async def sync_sticker_pack(bot: Bot, set_name, collections, ton_usd, state, pac
                         sticker=new_sticker,
                     )
                     updated += 1
+                    _mark_rendered(state, set_name, slug_lower, floor_price, change_24h)
 
                     sset = await bot.get_sticker_set(name=set_name)
                     _refresh_file_ids(pack_state, sset)
 
                 except Exception as e:
+                    if _is_flood(e):
+                        _on_flood(e)
                     log.warning(f"    Replace failed for {slug}: {e}")
                     try:
                         await bot.delete_sticker_from_set(sticker=old_fid)
                         del pack_state[slug_lower]
-                        await asyncio.sleep(0.3)
+                        await asyncio.sleep(API_SLEEP)
                         await _add_sticker(bot, set_name, col, ton_usd, pack_state)
+                        _mark_rendered(state, set_name, slug_lower, floor_price, change_24h)
                         updated += 1
+                    except FloodControlError:
+                        raise
                     except Exception as e2:
+                        if _is_flood(e2):
+                            _on_flood(e2)
                         log.error(f"    Fallback also failed for {slug}: {e2}")
             else:
                 await _add_sticker(bot, set_name, col, ton_usd, pack_state)
+                _mark_rendered(state, set_name, slug_lower, floor_price, change_24h)
                 updated += 1
 
-            await asyncio.sleep(0.35)
+            await asyncio.sleep(API_SLEEP)
 
-        log.info(f"  Updated {updated} stickers")
+        log.info(f"  Updated {updated}, skipped {skipped} unchanged stickers")
 
     state[set_name] = pack_state
     save_state(state)
@@ -850,6 +938,7 @@ def _refresh_file_ids(pack_state, sset):
 
 async def _add_sticker(bot: Bot, set_name, col, ton_usd, pack_state):
     """Добавляет один стикер в пак."""
+    _check_flood()
     slug = col.get("slug", "")
     gift_img = match_gift_image(slug)
     sticker_data, sticker_fmt, sticker_fname = _generate_sticker_data(col, ton_usd, gift_img)
@@ -868,6 +957,8 @@ async def _add_sticker(bot: Bot, set_name, col, ton_usd, pack_state):
         pack_state[slug.lower()] = sset.stickers[-1].file_id
         log.info(f"    + {slug} = {col.get('floor_price', 0):.2f} TON ({sticker_fmt})")
     except Exception as e:
+        if _is_flood(e):
+            _on_flood(e)
         log.warning(f"    ✗ Failed to add {slug}: {e}")
 
 
@@ -877,12 +968,28 @@ def prompt_pack_settings(username):
     """Спрашивает у пользователя название и описание паков перед запуском."""
     suffix = f"_by_{username}"
 
+    default_name = "giftprices"
+    default_title = "@mrkt - best place to trade gifts with 0%"
+
+    # Non-interactive mode: read from env vars (for systemd/VPS deployment)
+    env_name = os.environ.get("PACK_NAME", "").strip()
+    env_title = os.environ.get("PACK_TITLE", "").strip()
+    if env_name or os.environ.get("NON_INTERACTIVE", "").strip():
+        user_name = env_name or default_name
+        user_title = env_title or default_title
+        pack_names = []
+        for i in range(NUM_PACKS):
+            if i == 0:
+                pack_names.append(f"{user_name}{suffix}")
+            else:
+                pack_names.append(f"{user_name}_{i+1}{suffix}")
+        unupgraded_pack_name = f"unupgradedmrkt{suffix}"
+        log.info(f"Non-interactive mode: pack={user_name}, title={user_title}")
+        return pack_names, user_title, unupgraded_pack_name
+
     print("\n╔══════════════════════════════════════════════════╗")
     print("║       MRKT Animated Sticker Pack — Setup          ║")
     print("╚══════════════════════════════════════════════════╝")
-
-    default_name = "giftprices"
-    default_title = "@mrkt - best place to trade gifts with 0%"
 
     while True:
         print(f"\n  Pack name / Имя пака в ссылке t.me/addstickers/...")
@@ -966,7 +1073,7 @@ async def main():
 
         try:
             ton_usd = await fetch_ton_rate()
-            collections, expensive_map, exclude_set = await fetch_collections()
+            collections, expensive_map, cheapest_map, exclude_set = await fetch_collections()
 
             if not collections:
                 log.warning("No collections, skipping")
@@ -987,11 +1094,11 @@ async def main():
                 total = sum(len(state.get(pn, {})) for pn in pack_names)
                 log.info(f"Total: {total} stickers across {NUM_PACKS} packs")
 
-                # ─── Unupgraded Gems pack (uses most expensive version per slug) ───
+                # ─── Unupgraded Gems pack (uses cheapest / non-upgraded version) ───
                 if UNUPGRADED_SLUGS:
                     unupgraded_cols = []
                     for slug in UNUPGRADED_SLUGS:
-                        col = expensive_map.get(slug.lower())
+                        col = cheapest_map.get(slug.lower())
                         if col:
                             unupgraded_cols.append(col)
                         else:
@@ -1004,6 +1111,12 @@ async def main():
                             bot, unupgraded_pack_name, unupgraded_cols,
                             ton_usd, state)
 
+        except FloodControlError as e:
+            wait = e.retry_after + 60
+            log.warning(f"Flood control hit — waiting {wait}s before next cycle")
+            save_state(state)
+            await asyncio.sleep(wait)
+            continue
         except Exception as e:
             log.error(f"Error: {e}", exc_info=True)
 
