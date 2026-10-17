@@ -60,6 +60,7 @@ UPDATE_INTERVAL = 300  # секунд (5 минут — снижает риск 
 API_SLEEP = 1.5        # пауза между API-вызовами
 PRICE_PRECISION = 4
 CHANGE_PRECISION = 1
+TON_RATE_TOLERANCE = 0.01  # перерисовать, если курс TON/USD сдвинулся больше чем на 1%
 MAX_STICKERS = 50
 ANIMATED = os.environ.get("ANIMATED_STICKERS", "1").lower() in ("1", "true", "yes")
 
@@ -98,9 +99,12 @@ def _on_flood(e):
 
 # ─── Price change detection ───────────────────────────────────────
 
-def _price_changed(state, set_name, slug, floor_price, change_24h):
+def _price_changed(state, set_name, slug, floor_price, change_24h, ton_usd):
     rendered = state.get("_rendered", {}).get(set_name, {}).get(slug)
     if not rendered:
+        return True
+    old_rate = rendered.get("r", 0)
+    if not old_rate or abs(ton_usd - old_rate) / old_rate > TON_RATE_TOLERANCE:
         return True
     if round(floor_price, PRICE_PRECISION) != round(rendered.get("p", 0), PRICE_PRECISION):
         return True
@@ -109,10 +113,11 @@ def _price_changed(state, set_name, slug, floor_price, change_24h):
     return False
 
 
-def _mark_rendered(state, set_name, slug, floor_price, change_24h):
+def _mark_rendered(state, set_name, slug, floor_price, change_24h, ton_usd):
     rendered = state.setdefault("_rendered", {}).setdefault(set_name, {})
-    rendered[slug] = {"p": floor_price, "c": change_24h}
+    rendered[slug] = {"p": floor_price, "c": change_24h, "r": ton_usd}
 
+COINGECKO_API = "https://api.coingecko.com/api/v3/simple/price?ids=the-open-network&vs_currencies=usd"
 BINANCE_API = "https://api.binance.com/api/v3/ticker/price?symbol=TONUSDT"
 DUNE_API_KEY = os.environ.get("DUNE_API_KEY", "")
 DUNE_QUERY_ID = 5133545
@@ -538,15 +543,30 @@ def save_state(state):
 
 # ─── Data fetching ───────────────────────────────────────────────
 
+_last_ton_usd = 0.0
+
+
 async def fetch_ton_rate():
+    """Курс TON/USD: CoinGecko, запасной — Binance, при сбое — последний известный."""
+    global _last_ton_usd
+    sources = (
+        ("CoinGecko", COINGECKO_API, lambda d: d["the-open-network"]["usd"]),
+        ("Binance", BINANCE_API, lambda d: d["price"]),
+    )
     async with aiohttp.ClientSession() as s:
-        try:
-            async with s.get(BINANCE_API, timeout=aiohttp.ClientTimeout(total=10)) as r:
-                d = await r.json()
-                return float(d.get("price", 7.2))
-        except Exception as e:
-            log.warning(f"TON rate error: {e}")
-            return 7.2
+        for name, url, parse in sources:
+            try:
+                async with s.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    rate = float(parse(await r.json()))
+                if rate > 0:
+                    _last_ton_usd = rate
+                    return rate
+            except Exception as e:
+                log.warning(f"TON rate error ({name}): {e}")
+    if _last_ton_usd:
+        log.warning(f"TON rate unavailable, using last known ${_last_ton_usd:.2f}")
+        return _last_ton_usd
+    raise RuntimeError("TON rate unavailable")
 
 
 def _name_to_slug(name):
@@ -730,7 +750,7 @@ async def _sync_pack(bot: Bot, set_name, collections, ton_usd, state, title):
         log.info(f"  ✓ Pack created: https://t.me/addstickers/{set_name}")
         slug = col["slug"].lower()
         slots[:] = [slug]
-        _mark_rendered(state, set_name, slug, col.get("floor_price", 0), col.get("change_24h", 0))
+        _mark_rendered(state, set_name, slug, col.get("floor_price", 0), col.get("change_24h", 0), ton_usd)
         save_state(state)
         stickers = [None]
 
@@ -765,7 +785,7 @@ async def _sync_pack(bot: Bot, set_name, collections, ton_usd, state, title):
         change_24h = col.get("change_24h", 0)
 
         if i < len(slots) and slots[i] == slug \
-                and not _price_changed(state, set_name, slug, floor_price, change_24h):
+                and not _price_changed(state, set_name, slug, floor_price, change_24h, ton_usd):
             skipped += 1
             continue
 
@@ -797,7 +817,7 @@ async def _sync_pack(bot: Bot, set_name, collections, ton_usd, state, title):
             await asyncio.sleep(API_SLEEP)
             continue
 
-        _mark_rendered(state, set_name, slug, floor_price, change_24h)
+        _mark_rendered(state, set_name, slug, floor_price, change_24h, ton_usd)
         save_state(state)
         updated += 1
         log.info(f"    ✓ #{i + 1} {slug} = {floor_price:.2f} TON ({fmt})")
