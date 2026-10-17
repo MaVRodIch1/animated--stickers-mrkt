@@ -662,160 +662,42 @@ NUM_PACKS = 3
 
 async def sync_unupgraded_pack(bot: Bot, set_name, collections, ton_usd, state):
     """Create or update the unupgraded gems sticker pack."""
-    pack_state = state.setdefault(set_name, {})
-
-    existing = None
-    try:
-        existing = await bot.get_sticker_set(name=set_name)
-        log.info(f"  Unupgraded pack {set_name}: {len(existing.stickers)} stickers")
-    except Exception:
-        pass
-
-    if not existing:
-        if not collections:
-            return
-
-        col = collections[0]
-        slug = col.get("slug", "unknown")
-        gift_img = match_gift_image(slug)
-        sticker_data, sticker_fmt, sticker_fname = _generate_sticker_data(col, ton_usd, gift_img)
-
-        try:
-            sticker = InputSticker(
-                sticker=BufferedInputFile(sticker_data, filename=sticker_fname),
-                emoji_list=[get_emoji(slug)],
-                format=sticker_fmt,
-            )
-            await bot.create_new_sticker_set(
-                user_id=OWNER_ID,
-                name=set_name,
-                title="MRKT Unupgraded Gems",
-                stickers=[sticker],
-            )
-            log.info(f"  Unupgraded pack created: https://t.me/addstickers/{set_name}")
-
-            sset = await bot.get_sticker_set(name=set_name)
-            pack_state[slug.lower()] = sset.stickers[0].file_id
-
-            for col in collections[1:MAX_STICKERS]:
-                await asyncio.sleep(0.5)
-                s = col.get("slug", "")
-                gi = match_gift_image(s)
-                sd, sf, sfn = _generate_sticker_data(col, ton_usd, gi)
-                try:
-                    st = InputSticker(
-                        sticker=BufferedInputFile(sd, filename=sfn),
-                        emoji_list=[get_emoji(s)],
-                        format=sf,
-                    )
-                    await bot.add_sticker_to_set(
-                        user_id=OWNER_ID, name=set_name, sticker=st)
-                    sset = await bot.get_sticker_set(name=set_name)
-                    pack_state[s.lower()] = sset.stickers[-1].file_id
-                    log.info(f"    + {s} (unupgraded, {len(sd)/1024:.1f}KB)")
-                except Exception as e:
-                    log.warning(f"    Failed to add unupgraded {s}: {e}")
-
-        except Exception as e:
-            log.error(f"  Failed to create unupgraded pack: {e}")
-
-    else:
-        existing_file_ids = {s.file_id for s in existing.stickers}
-        updated = 0
-        skipped = 0
-
-        # Track which slugs we're syncing this round
-        current_slugs = set()
-
-        for col in collections[:MAX_STICKERS]:
-            _check_flood()
-
-            slug = col.get("slug", "").lower()
-            if not slug:
-                continue
-            current_slugs.add(slug)
-
-            floor_price = col.get("floor_price", 0)
-            change_24h = col.get("change_24h", 0)
-            old_fid = pack_state.get(slug)
-
-            if old_fid and old_fid in existing_file_ids:
-                if not _price_changed(state, set_name, slug, floor_price, change_24h):
-                    skipped += 1
-                    continue
-
-                gift_img = match_gift_image(slug)
-                sticker_data, sticker_fmt, sticker_fname = _generate_sticker_data(col, ton_usd, gift_img)
-                try:
-                    new_sticker = InputSticker(
-                        sticker=BufferedInputFile(sticker_data, filename=sticker_fname),
-                        emoji_list=[get_emoji(slug)],
-                        format=sticker_fmt,
-                    )
-                    await bot.replace_sticker_in_set(
-                        user_id=OWNER_ID, name=set_name,
-                        old_sticker=old_fid, sticker=new_sticker)
-                    updated += 1
-                    _mark_rendered(state, set_name, slug, floor_price, change_24h)
-                    sset = await bot.get_sticker_set(name=set_name)
-                    _refresh_file_ids(pack_state, sset)
-                except Exception as e:
-                    if _is_flood(e):
-                        _on_flood(e)
-                    log.warning(f"    Replace failed for unupgraded {slug}: {e}")
-            else:
-                gi = match_gift_image(slug)
-                sd, sf, sfn = _generate_sticker_data(col, ton_usd, gi)
-                try:
-                    st = InputSticker(
-                        sticker=BufferedInputFile(sd, filename=sfn),
-                        emoji_list=[get_emoji(slug)],
-                        format=sf,
-                    )
-                    await bot.add_sticker_to_set(
-                        user_id=OWNER_ID, name=set_name, sticker=st)
-                    sset = await bot.get_sticker_set(name=set_name)
-                    pack_state[slug] = sset.stickers[-1].file_id
-                    log.info(f"    + {slug} (unupgraded, {len(sd)/1024:.1f}KB)")
-                    updated += 1
-                    _mark_rendered(state, set_name, slug, floor_price, change_24h)
-                except Exception as e:
-                    if _is_flood(e):
-                        _on_flood(e)
-                    log.warning(f"    Failed to add unupgraded {slug}: {e}")
-
-            await asyncio.sleep(API_SLEEP)
-
-        # Remove stale stickers that no longer belong to the unupgraded set
-        # 1) Remove slugs from pack_state that aren't in current collections
-        stale_slugs = [s for s in list(pack_state.keys()) if s not in current_slugs]
-        for s in stale_slugs:
-            pack_state.pop(s, None)
-
-        # 2) Delete any stickers from the actual pack that aren't tracked by current pack_state
-        sset = await bot.get_sticker_set(name=set_name)
-        known_fids = set(pack_state.values())
-        removed = 0
-        for sticker in sset.stickers:
-            if sticker.file_id not in known_fids:
-                try:
-                    await bot.delete_sticker_from_set(sticker=sticker.file_id)
-                    removed += 1
-                    await asyncio.sleep(0.3)
-                except Exception as e:
-                    log.warning(f"    Failed to remove stale sticker: {e}")
-        if removed:
-            log.info(f"  Removed {removed} stale stickers from unupgraded pack")
-
-        log.info(f"  Unupgraded pack: updated {updated} stickers")
-
-    state[set_name] = pack_state
-    save_state(state)
+    await _sync_pack(bot, set_name, collections, ton_usd, state, "MRKT Unupgraded Gems")
 
 
 async def sync_sticker_pack(bot: Bot, set_name, collections, ton_usd, state, pack_num=1):
     """Создаёт или обновляет один стикерпак (до 50 стикеров)."""
-    pack_state = state.setdefault(set_name, {})
+    title = f"{state.get('_pack_title', '@mrkt - best place to trade gifts with 0%')} #{pack_num}"
+    await _sync_pack(bot, set_name, collections, ton_usd, state, title)
+
+
+def _make_input_sticker(col, ton_usd):
+    slug = col.get("slug", "")
+    gift_img = match_gift_image(slug)
+    data, fmt, fname = _generate_sticker_data(col, ton_usd, gift_img)
+    sticker = InputSticker(
+        sticker=BufferedInputFile(data, filename=fname),
+        emoji_list=[get_emoji(slug)],
+        format=fmt,
+    )
+    return sticker, fmt
+
+
+async def _sync_pack(bot: Bot, set_name, collections, ton_usd, state, title):
+    """Синхронизирует пак по позициям: стикер №i в паке = collections[i].
+
+    Ключ — позиция, а не file_id: replace_sticker_in_set сохраняет позицию,
+    а file_id из прошлых циклов могут устареть, и тогда бот перестаёт узнавать
+    свои стикеры и забивает пак дублями до лимита (STICKERS_TOO_MUCH).
+    file_id берутся из свежего get_sticker_set в начале каждого цикла,
+    лишние стикеры в конце пака удаляются.
+    """
+    targets = [c for c in collections[:MAX_STICKERS] if c.get("slug")]
+    if not targets:
+        return
+
+    # slug на каждой позиции пака (None — неизвестно, перерисовать)
+    slots = state.setdefault("_slots", {}).setdefault(set_name, [])
 
     existing = None
     try:
@@ -824,142 +706,101 @@ async def sync_sticker_pack(bot: Bot, set_name, collections, ton_usd, state, pac
     except Exception:
         pass
 
-    if not existing:
-        if not collections:
-            return
-
-        col = collections[0]
-        slug = col.get("slug", "unknown")
-        gift_img = match_gift_image(slug)
-        sticker_data, sticker_fmt, sticker_fname = _generate_sticker_data(col, ton_usd, gift_img)
-
+    if existing:
+        stickers = list(existing.stickers)
+    else:
+        col = targets[0]
+        sticker, _ = _make_input_sticker(col, ton_usd)
         try:
-            sticker = InputSticker(
-                sticker=BufferedInputFile(sticker_data, filename=sticker_fname),
-                emoji_list=[get_emoji(slug)],
-                format=sticker_fmt,
-            )
             await bot.create_new_sticker_set(
                 user_id=OWNER_ID,
                 name=set_name,
-                title=f"{state.get('_pack_title', '@mrkt - best place to trade gifts with 0%')} #{pack_num}",
+                title=title,
                 stickers=[sticker],
             )
-            log.info(f"  ✓ Pack created: https://t.me/addstickers/{set_name}")
-
-            sset = await bot.get_sticker_set(name=set_name)
-            pack_state[slug.lower()] = sset.stickers[0].file_id
-
-            for col in collections[1:MAX_STICKERS]:
-                await asyncio.sleep(0.5)
-                await _add_sticker(bot, set_name, col, ton_usd, pack_state)
-
         except Exception as e:
+            if _is_flood(e):
+                _on_flood(e)
             log.error(f"  Failed to create pack: {e}")
+            return
+        log.info(f"  ✓ Pack created: https://t.me/addstickers/{set_name}")
+        slug = col["slug"].lower()
+        slots[:] = [slug]
+        _mark_rendered(state, set_name, slug, col.get("floor_price", 0), col.get("change_24h", 0))
+        save_state(state)
+        stickers = [None]
 
-    else:
-        existing_file_ids = {s.file_id for s in existing.stickers}
+    # 1) Удаляем лишние стикеры с конца пака
+    removed = 0
+    while len(stickers) > len(targets):
+        _check_flood()
+        extra = stickers.pop()
+        try:
+            await bot.delete_sticker_from_set(sticker=extra.file_id)
+            removed += 1
+        except Exception as e:
+            if _is_flood(e):
+                _on_flood(e)
+            log.warning(f"    Failed to remove extra sticker: {e}")
+        await asyncio.sleep(API_SLEEP)
+    if removed:
+        log.info(f"  Removed {removed} extra stickers")
 
-        updated = 0
-        skipped = 0
-        for col in collections[:MAX_STICKERS]:
-            _check_flood()
-
-            slug = col.get("slug", "")
-            if not slug:
-                continue
-            slug_lower = slug.lower()
-            floor_price = col.get("floor_price", 0)
-            change_24h = col.get("change_24h", 0)
-            old_fid = pack_state.get(slug_lower)
-
-            if old_fid and old_fid in existing_file_ids:
-                if not _price_changed(state, set_name, slug_lower, floor_price, change_24h):
-                    skipped += 1
-                    continue
-
-                gift_img = match_gift_image(slug)
-                sticker_data, sticker_fmt, sticker_fname = _generate_sticker_data(col, ton_usd, gift_img)
-                try:
-                    new_sticker = InputSticker(
-                        sticker=BufferedInputFile(sticker_data, filename=sticker_fname),
-                        emoji_list=[get_emoji(slug)],
-                        format=sticker_fmt,
-                    )
-                    await bot.replace_sticker_in_set(
-                        user_id=OWNER_ID,
-                        name=set_name,
-                        old_sticker=old_fid,
-                        sticker=new_sticker,
-                    )
-                    updated += 1
-                    _mark_rendered(state, set_name, slug_lower, floor_price, change_24h)
-
-                    sset = await bot.get_sticker_set(name=set_name)
-                    _refresh_file_ids(pack_state, sset)
-
-                except Exception as e:
-                    if _is_flood(e):
-                        _on_flood(e)
-                    log.warning(f"    Replace failed for {slug}: {e}")
-                    try:
-                        await bot.delete_sticker_from_set(sticker=old_fid)
-                        del pack_state[slug_lower]
-                        await asyncio.sleep(API_SLEEP)
-                        await _add_sticker(bot, set_name, col, ton_usd, pack_state)
-                        _mark_rendered(state, set_name, slug_lower, floor_price, change_24h)
-                        updated += 1
-                    except FloodControlError:
-                        raise
-                    except Exception as e2:
-                        if _is_flood(e2):
-                            _on_flood(e2)
-                        log.error(f"    Fallback also failed for {slug}: {e2}")
-            else:
-                await _add_sticker(bot, set_name, col, ton_usd, pack_state)
-                _mark_rendered(state, set_name, slug_lower, floor_price, change_24h)
-                updated += 1
-
-            await asyncio.sleep(API_SLEEP)
-
-        log.info(f"  Updated {updated}, skipped {skipped} unchanged stickers")
-
-    state[set_name] = pack_state
+    del slots[len(stickers):]
+    slots.extend([None] * (len(stickers) - len(slots)))
     save_state(state)
 
+    # 2) Заменяем стикеры по позициям, недостающие добавляем в конец
+    updated = 0
+    skipped = 0
+    for i, col in enumerate(targets):
+        _check_flood()
 
-def _refresh_file_ids(pack_state, sset):
-    """Обновляет маппинг slug -> file_id из актуального стикерсета."""
-    slugs = list(pack_state.keys())
-    for i, sticker in enumerate(sset.stickers):
-        if i < len(slugs):
-            pack_state[slugs[i]] = sticker.file_id
+        slug = col["slug"].lower()
+        floor_price = col.get("floor_price", 0)
+        change_24h = col.get("change_24h", 0)
 
+        if i < len(slots) and slots[i] == slug \
+                and not _price_changed(state, set_name, slug, floor_price, change_24h):
+            skipped += 1
+            continue
 
-async def _add_sticker(bot: Bot, set_name, col, ton_usd, pack_state):
-    """Добавляет один стикер в пак."""
-    _check_flood()
-    slug = col.get("slug", "")
-    gift_img = match_gift_image(slug)
-    sticker_data, sticker_fmt, sticker_fname = _generate_sticker_data(col, ton_usd, gift_img)
-    try:
-        sticker = InputSticker(
-            sticker=BufferedInputFile(sticker_data, filename=sticker_fname),
-            emoji_list=[get_emoji(slug)],
-            format=sticker_fmt,
-        )
-        await bot.add_sticker_to_set(
-            user_id=OWNER_ID,
-            name=set_name,
-            sticker=sticker,
-        )
-        sset = await bot.get_sticker_set(name=set_name)
-        pack_state[slug.lower()] = sset.stickers[-1].file_id
-        log.info(f"    + {slug} = {col.get('floor_price', 0):.2f} TON ({sticker_fmt})")
-    except Exception as e:
-        if _is_flood(e):
-            _on_flood(e)
-        log.warning(f"    ✗ Failed to add {slug}: {e}")
+        sticker, fmt = _make_input_sticker(col, ton_usd)
+        try:
+            if i < len(stickers):
+                await bot.replace_sticker_in_set(
+                    user_id=OWNER_ID,
+                    name=set_name,
+                    old_sticker=stickers[i].file_id,
+                    sticker=sticker,
+                )
+                slots[i] = slug
+            else:
+                await bot.add_sticker_to_set(
+                    user_id=OWNER_ID,
+                    name=set_name,
+                    sticker=sticker,
+                )
+                stickers.append(None)
+                slots.append(slug)
+        except Exception as e:
+            if _is_flood(e):
+                _on_flood(e)
+            log.warning(f"    ✗ Failed to update {slug} (#{i + 1}): {e}")
+            if i >= len(stickers):
+                break  # добавление в конец не удалось — дальше позиции съедут
+            slots[i] = None
+            await asyncio.sleep(API_SLEEP)
+            continue
+
+        _mark_rendered(state, set_name, slug, floor_price, change_24h)
+        save_state(state)
+        updated += 1
+        log.info(f"    ✓ #{i + 1} {slug} = {floor_price:.2f} TON ({fmt})")
+        await asyncio.sleep(API_SLEEP)
+
+    log.info(f"  Updated {updated}, skipped {skipped} unchanged stickers")
+    save_state(state)
 
 
 # ─── Main loop ───────────────────────────────────────────────────
@@ -1091,7 +932,7 @@ async def main():
                     log.info(f"Pack #{i+1} ({pack_name}): {len(chunk)} collections")
                     await sync_sticker_pack(bot, pack_name, chunk, ton_usd, state, i + 1)
 
-                total = sum(len(state.get(pn, {})) for pn in pack_names)
+                total = sum(len(state.get("_slots", {}).get(pn, [])) for pn in pack_names)
                 log.info(f"Total: {total} stickers across {NUM_PACKS} packs")
 
                 # ─── Unupgraded Gems pack (uses cheapest / non-upgraded version) ───
