@@ -63,6 +63,8 @@ CHANGE_PRECISION = 1
 MAX_STICKERS = 50
 ANIMATED = os.environ.get("ANIMATED_STICKERS", "1").lower() in ("1", "true", "yes")
 
+EXCLUDE_SLUGS = {"christmastree"}
+
 
 # ─── Flood control ────────────────────────────────────────────────
 _flood_until = 0.0
@@ -599,6 +601,8 @@ async def fetch_collections():
     expensive = {}
     for p in prices:
         slug = p["slug"]
+        if slug in EXCLUDE_SLUGS:
+            continue
         if slug not in cheapest or p["floor_price"] < cheapest[slug]["floor_price"]:
             cheapest[slug] = p
         if slug not in expensive or p["floor_price"] > expensive[slug]["floor_price"]:
