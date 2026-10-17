@@ -239,7 +239,9 @@ Just edit `sticker_image.py`. Next 60-sec cycle will replace every sticker with 
 
 ### Adding a brand-new collection that just launched on MRKT
 
-Usually nothing is needed — the script picks up all collections from the Contest API by floor price. Custom image is optional.
+Nothing is needed — the script picks up all collections from the Contest API by floor price, and gift images are matched automatically: on start and then whenever a collection has no image (at most once an hour) it loads the full gift id list from `api.changes.tg/ids` and downloads the missing pictures. Add `gift_overrides/<slug>.webp` only if changes.tg has no image for the gift.
+
+Ничего делать не нужно — новые коллекции берутся из Contest API автоматически, а картинки подтягиваются из `api.changes.tg/ids` при старте и во время работы (не чаще раза в час для отсутствующих). `gift_overrides/<slug>.webp` нужен, только если на changes.tg картинки нет.
 
 ### The unupgraded pack only has 2 stickers after restart
 

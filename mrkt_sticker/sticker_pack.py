@@ -312,14 +312,12 @@ SLUG_TO_GIFT_ID = {
     "moodpack": "5886756255493523118",
     "santahat": "5983471780763796287",
     "heartlocket": "5868455043362980631",
-    "gingerman": "5983484377902875708",
     "signetring": "5936085638515261992",
     "preciouspeach": "5933671725160989227",
     "magicpotion": "5846226946928673709",
     "kissedfrog": "5845776576658015084",
     "hexpot": "5825801628657124140",
     "evileye": "5825480571261813595",
-    "sharptounge": "5841689550203650524",
     "trappedheart": "5841391256135008713",
     "skullflower": "5839038009193792264",
     "scaredcat": "5837059369300132790",
@@ -350,7 +348,6 @@ SLUG_TO_GIFT_ID = {
     "starnotepad": "5936017773737018241",
     "deskcalendar": "5782988952268964995",
     "bdaycandle": "5782984811920491178",
-    "jellyBunny": "5915502858152706668",
     "spicedwine": "5913442287462908725",
     "perfumebottle": "5913517067138499193",
     "berrybox": "5882252952218894938",
@@ -378,14 +375,11 @@ SLUG_TO_GIFT_ID = {
     "bowtie": "5895544372761461960",
     "lushbouquet": "5871002671934079382",
     "whipcupcake": "5933543975653737112",
-    "joyfullbundle": "5870862540036113469",
     "cupidcharm": "5868561433997870501",
     "valentinebox": "5868595669182186720",
-    "snoopDogg": "6014591077976114307",
     "swagbag": "6012607142387778152",
     "snoopcigar": "6012435906336654262",
     "lowrider": "6014675319464657779",
-    "westsisesign": "6014697240977737490",
     "stellarrocket": "6042113507581755979",
     "jollychimp": "6005880141270483700",
     "moonpendant": "5998981470310368313",
@@ -405,7 +399,6 @@ SLUG_TO_GIFT_ID = {
     "blingbinky": "5902339509239940491",
     "moneypot": "5963238670868677492",
     "prettyposy": "5933737850477478635",
-    "bonedring": "5870661333703197240",
     "petsnake": "6023917088358269866",
     "snakebox": "6023679164349940429",
     "jackinthebox": "6005659564635063386",
@@ -428,10 +421,60 @@ SLUG_TO_GIFT_ID = {
 }
 
 
+GIFT_RETRY_SEC = 3600  # как часто повторять поиск картинок, которых нет
+_gift_ids_fetched_at = 0.0
+_gift_image_failed_at = {}  # slug -> время последней неудачной попытки
+
+
+async def refresh_gift_ids(session):
+    """Подтягивает актуальный список id всех подарков Telegram с changes.tg.
+
+    Новые подарки получают картинки автоматически, без правки SLUG_TO_GIFT_ID.
+    """
+    global _gift_ids_fetched_at
+    _gift_ids_fetched_at = time.time()
+    try:
+        async with session.get(f"{CHANGES_TG_API}/ids", timeout=aiohttp.ClientTimeout(total=15)) as r:
+            if r.status != 200:
+                log.warning(f"changes.tg /ids: HTTP {r.status}")
+                return
+            ids = await r.json()
+    except Exception as e:
+        log.warning(f"changes.tg /ids: {e}")
+        return
+
+    added = 0
+    for gift_id, name in ids.items():
+        slug = _name_to_slug(name)
+        if not slug:
+            continue
+        if slug not in SLUG_TO_GIFT_ID:
+            added += 1
+        SLUG_TO_GIFT_ID[slug] = str(gift_id)
+    log.info(f"changes.tg: {len(ids)} gift ids ({added} new)")
+
+
+async def _download_gift_image(session, slug, gift_id):
+    url = f"{CHANGES_TG_API}/original/{gift_id}.png"
+    path = os.path.join(GIFT_CACHE_DIR, f"{slug}.png")
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
+            if r.status != 200:
+                log.warning(f"  ✗ {slug}: HTTP {r.status}")
+                return False
+            data = await r.read()
+        gift_images_cache[slug] = Image.open(io.BytesIO(data)).copy()
+        with open(path, "wb") as f:
+            f.write(data)
+        log.info(f"  ✓ {slug} (gift #{gift_id}, {len(data)} bytes)")
+        return True
+    except Exception as e:
+        log.warning(f"  ✗ {slug}: {e}")
+        return False
+
+
 async def load_gift_images(bot: Bot):
     """Скачивает PNG-картинки подарков из api.changes.tg и кэширует на диск."""
-    global gift_images_cache
-
     os.makedirs(GIFT_CACHE_DIR, exist_ok=True)
 
     if os.path.isdir(GIFT_OVERRIDES_DIR):
@@ -445,80 +488,59 @@ async def load_gift_images(bot: Bot):
                 except Exception:
                     pass
 
-    loaded = 0
-    for slug, gid in SLUG_TO_GIFT_ID.items():
-        if slug in gift_images_cache:
-            continue
+    async with aiohttp.ClientSession() as session:
+        await refresh_gift_ids(session)
+        await ensure_gift_images(list(SLUG_TO_GIFT_ID), session)
+
+    log.info(f"Gift images ready: {len(gift_images_cache)}")
+
+
+async def ensure_gift_images(slugs, session=None):
+    """Докачивает картинки для slug'ов, у которых их ещё нет (диск-кэш → changes.tg).
+
+    Вызывается каждый цикл, поэтому подарки, вышедшие во время работы бота,
+    тоже получают картинку; неудачные попытки повторяются не чаще GIFT_RETRY_SEC.
+    """
+    now = time.time()
+    missing = [s for s in dict.fromkeys(slugs)
+               if s not in gift_images_cache
+               and now - _gift_image_failed_at.get(s, 0) > GIFT_RETRY_SEC]
+    if not missing:
+        return
+
+    for slug in list(missing):
         path = os.path.join(GIFT_CACHE_DIR, f"{slug}.png")
         if os.path.exists(path):
             try:
                 gift_images_cache[slug] = Image.open(path).copy()
-                loaded += 1
+                missing.remove(slug)
             except Exception:
                 pass
-
-    if loaded > 0:
-        log.info(f"Loaded {loaded} gift images from cache")
-
-    missing = {s: gid for s, gid in SLUG_TO_GIFT_ID.items() if s not in gift_images_cache}
     if not missing:
         return
 
-    log.info(f"Downloading {len(missing)} gift images from api.changes.tg...")
-    async with aiohttp.ClientSession() as session:
-        for slug, gift_id in missing.items():
-            url = f"{CHANGES_TG_API}/original/{gift_id}.png"
-            path = os.path.join(GIFT_CACHE_DIR, f"{slug}.png")
-            try:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
-                    if r.status == 200:
-                        data = await r.read()
-                        with open(path, "wb") as f:
-                            f.write(data)
-                        gift_images_cache[slug] = Image.open(io.BytesIO(data)).copy()
-                        log.info(f"  ✓ {slug} (gift #{gift_id}, {len(data)} bytes)")
-                    else:
-                        log.warning(f"  ✗ {slug}: HTTP {r.status}")
-            except Exception as e:
-                log.warning(f"  ✗ {slug}: {e}")
+    own_session = session is None
+    if own_session:
+        session = aiohttp.ClientSession()
+    try:
+        if any(s not in SLUG_TO_GIFT_ID for s in missing) \
+                and now - _gift_ids_fetched_at > GIFT_RETRY_SEC:
+            await refresh_gift_ids(session)
+
+        log.info(f"Downloading {len(missing)} gift images from api.changes.tg...")
+        for slug in missing:
+            gift_id = SLUG_TO_GIFT_ID.get(slug)
+            if not gift_id or not await _download_gift_image(session, slug, gift_id):
+                _gift_image_failed_at[slug] = now
             await asyncio.sleep(0.2)
+    finally:
+        if own_session:
+            await session.close()
 
-    total = len(SLUG_TO_GIFT_ID)
-    found = len(gift_images_cache)
-    failed = total - found
-    log.info(f"Gift images ready: {found}/{total}")
-    if failed > 0:
-        missing_slugs = [s for s in SLUG_TO_GIFT_ID if s not in gift_images_cache]
-        log.warning(f"⚠ {failed} gift images not found!")
-        log.warning(f"  Missing: {', '.join(missing_slugs[:20])}"
-                    + (f" ... and {len(missing_slugs)-20} more" if len(missing_slugs) > 20 else ""))
-
-
-async def try_fetch_gift_image(slug, collections):
-    """Пытается найти gift_id в данных коллекции и скачать картинку."""
-    if slug in gift_images_cache:
-        return gift_images_cache[slug]
-
-    for col in collections:
-        if col.get("slug", "").lower() == slug:
-            gift_id = col.get("gift_id") or col.get("id") or col.get("giftId")
-            if gift_id:
-                SLUG_TO_GIFT_ID[slug] = gift_id
-                path = os.path.join(GIFT_CACHE_DIR, f"{slug}.png")
-                url = f"{CHANGES_TG_API}/original/{gift_id}.png"
-                try:
-                    async with aiohttp.ClientSession() as session:
-                        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
-                            if r.status == 200:
-                                data = await r.read()
-                                with open(path, "wb") as f:
-                                    f.write(data)
-                                gift_images_cache[slug] = Image.open(io.BytesIO(data)).copy()
-                                log.info(f"  Fetched gift image for {slug} (id={gift_id})")
-                                return gift_images_cache[slug]
-                except Exception:
-                    pass
-    return None
+    failed = [s for s in missing if s not in gift_images_cache]
+    if failed:
+        log.warning(f"⚠ No image for: {', '.join(failed[:20])}"
+                    + (f" ... and {len(failed) - 20} more" if len(failed) > 20 else ""))
 
 
 def match_gift_image(slug):
@@ -946,6 +968,8 @@ async def main():
                 log.info(f"Fetched {len(collections)} collections from MRKT, TON=${ton_usd:.2f}")
 
                 # Main packs: exclude only single-version unupgraded slugs
+                await ensure_gift_images([c["slug"] for c in collections])
+
                 main_cols = [c for c in collections if c["slug"] not in exclude_set]
                 log.info(f"Main packs: {len(main_cols)} collections (excluded {len(exclude_set)} unupgraded)")
 
