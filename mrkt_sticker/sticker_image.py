@@ -46,6 +46,12 @@ ANIM_FPS = 30
 ANIM_DURATION = 3  # seconds — smoother, longer loop
 ANIM_FRAMES = ANIM_FPS * ANIM_DURATION
 
+# Область под картинку подарка: высота фиксирована, широкие картинки могут
+# выходить за квадрат по ширине (пропорции сохраняются)
+GIFT_TOP = 86
+GIFT_H = 140
+GIFT_MAX_W = 240
+
 # Slugs that should show "unboxed" label
 UNBOXED_SLUGS = {"ufcstrike"}
 
@@ -637,7 +643,24 @@ def _build_base_layer(col, ton_usd, accent, change):
     return img
 
 
-def _render_frame(base_img, frame_num, total_frames, accent, change, gift_img, col):
+def _fit_gift(gift_img):
+    """Обрезает прозрачные поля и вписывает картинку в GIFT_MAX_W x GIFT_H.
+
+    Возвращает (RGBA-картинка, x, y) для вставки или None.
+    """
+    if not gift_img:
+        return None
+    g = gift_img.convert("RGBA")
+    bbox = g.getchannel("A").point(lambda v: 255 if v > 10 else 0).getbbox()
+    if bbox:
+        g = g.crop(bbox)
+    scale = min(GIFT_MAX_W / g.width, GIFT_H / g.height)
+    w, h = max(1, round(g.width * scale)), max(1, round(g.height * scale))
+    g = g.resize((w, h), Image.LANCZOS)
+    return g, (W - w) // 2, GIFT_TOP + (GIFT_H - h) // 2
+
+
+def _render_frame(base_img, frame_num, total_frames, accent, change, gift, col):
     """Render a single animation frame with animated effects on top of base."""
     t = frame_num / total_frames  # 0.0 to 1.0
     img = base_img.copy()
@@ -679,16 +702,10 @@ def _render_frame(base_img, frame_num, total_frames, accent, change, gift_img, c
     draw = ImageDraw.Draw(img)
 
     # 7. Gift image with gentle slow bob
-    if gift_img:
-        thumb_size = 140
-        try:
-            gift_resized = gift_img.copy().resize((thumb_size, thumb_size), Image.LANCZOS)
-            if gift_resized.mode != "RGBA":
-                gift_resized = gift_resized.convert("RGBA")
-            bob_y = int(3 * math.sin(t * 2 * math.pi))
-            img.paste(gift_resized, ((W - thumb_size) // 2, 86 + bob_y), gift_resized)
-        except Exception:
-            pass
+    if gift:
+        thumb, x, y = gift
+        bob_y = int(3 * math.sin(t * 2 * math.pi))
+        img.paste(thumb, (x, y + bob_y), thumb)
 
     return img
 
@@ -804,16 +821,14 @@ def _generate_static(col, ton_usd, fmt, gift_img, accent, change):
     display_name = format_slug(slug)
     _center(draw, display_name, _fit_font(draw, display_name, W - 50, 44, 24), 44, GOLD)
 
-    if gift_img:
-        thumb_size = 140
-        try:
-            gift_resized = gift_img.copy().resize((thumb_size, thumb_size), Image.LANCZOS)
-            if gift_resized.mode != "RGBA":
-                gift_resized = gift_resized.convert("RGBA")
-            img.paste(gift_resized, ((W - thumb_size) // 2, 86), gift_resized)
-            draw = ImageDraw.Draw(img)
-        except Exception:
-            pass
+    try:
+        gift = _fit_gift(gift_img)
+    except Exception:
+        gift = None
+    if gift:
+        thumb, x, y = gift
+        img.paste(thumb, (x, y), thumb)
+        draw = ImageDraw.Draw(img)
 
     price_text = f"${usd:,.2f}"
     f_price = _fit_font(draw, price_text, W - 50, 70, 36)
@@ -881,12 +896,16 @@ def _generate_animated(col, ton_usd, accent, change, gift_img):
     """Generate animated WebM video sticker."""
     # Build static base layer (text, border, watermark, prices — don't change per frame)
     base = _build_base_layer(col, ton_usd, accent, change)
+    try:
+        gift = _fit_gift(gift_img)
+    except Exception:
+        gift = None
 
     tmp_dir = tempfile.mkdtemp(prefix="mrkt_anim_")
     try:
         # Render frames
         for i in range(ANIM_FRAMES):
-            frame = _render_frame(base, i, ANIM_FRAMES, accent, change, gift_img, col)
+            frame = _render_frame(base, i, ANIM_FRAMES, accent, change, gift, col)
             frame_path = os.path.join(tmp_dir, f"{i:04d}.png")
             frame.save(frame_path, format="PNG")
 
