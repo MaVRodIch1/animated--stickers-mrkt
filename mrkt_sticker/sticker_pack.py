@@ -939,11 +939,11 @@ async def main():
                 total = sum(len(state.get("_slots", {}).get(pn, [])) for pn in pack_names)
                 log.info(f"Total: {total} stickers across {NUM_PACKS} packs")
 
-                # ─── Unupgraded Gems pack (uses cheapest / non-upgraded version) ───
+                # ─── Unupgraded Gems pack (uses most expensive version per slug) ───
                 if UNUPGRADED_SLUGS:
                     unupgraded_cols = []
                     for slug in UNUPGRADED_SLUGS:
-                        col = cheapest_map.get(slug.lower())
+                        col = expensive_map.get(slug.lower())
                         if col:
                             unupgraded_cols.append(col)
                         else:
